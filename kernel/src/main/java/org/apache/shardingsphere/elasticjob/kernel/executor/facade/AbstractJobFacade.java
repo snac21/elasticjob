@@ -28,6 +28,9 @@ import org.apache.shardingsphere.elasticjob.kernel.infra.exception.JobExecutionE
 import org.apache.shardingsphere.elasticjob.kernel.internal.config.ConfigurationService;
 import org.apache.shardingsphere.elasticjob.kernel.internal.context.TaskContext;
 import org.apache.shardingsphere.elasticjob.kernel.internal.failover.FailoverService;
+import org.apache.shardingsphere.elasticjob.kernel.internal.schedule.JobRegistry;
+import org.apache.shardingsphere.elasticjob.kernel.internal.server.ServerService;
+import org.apache.shardingsphere.elasticjob.kernel.internal.sharding.JobInstance;
 import org.apache.shardingsphere.elasticjob.kernel.internal.sharding.ExecutionContextService;
 import org.apache.shardingsphere.elasticjob.kernel.internal.sharding.ExecutionService;
 import org.apache.shardingsphere.elasticjob.kernel.internal.sharding.ShardingService;
@@ -48,31 +51,37 @@ import lombok.extern.slf4j.Slf4j;
  */
 @Slf4j
 abstract class AbstractJobFacade implements JobFacade {
-    
+
+    private final String jobName;
+
     private final ConfigurationService configService;
-    
+
     private final ShardingService shardingService;
-    
+
     private final ExecutionContextService executionContextService;
-    
+
     private final ExecutionService executionService;
-    
+
     private final FailoverService failoverService;
-    
+
+    private final ServerService serverService;
+
     private final Collection<ElasticJobListener> elasticJobListeners;
-    
+
     private final JobTracingEventBus jobTracingEventBus;
-    
+
     AbstractJobFacade(final CoordinatorRegistryCenter regCenter, final String jobName, final Collection<ElasticJobListener> elasticJobListeners, final TracingConfiguration<?> tracingConfig) {
+        this.jobName = jobName;
         configService = new ConfigurationService(regCenter, jobName);
         shardingService = new ShardingService(regCenter, jobName);
         executionContextService = new ExecutionContextService(regCenter, jobName);
         executionService = new ExecutionService(regCenter, jobName);
         failoverService = new FailoverService(regCenter, jobName);
+        serverService = new ServerService(regCenter, jobName);
         this.elasticJobListeners = elasticJobListeners.stream().sorted(Comparator.comparingInt(ElasticJobListener::order)).collect(Collectors.toList());
         this.jobTracingEventBus = null == tracingConfig ? new JobTracingEventBus() : new JobTracingEventBus(tracingConfig);
     }
-    
+
     /**
      * Load job configuration.
      *
@@ -83,7 +92,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public JobConfiguration loadJobConfiguration(final boolean fromCache) {
         return configService.load(fromCache);
     }
-    
+
     /**
      * Check job execution environment.
      *
@@ -93,7 +102,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public void checkJobExecutionEnvironment() throws JobExecutionEnvironmentException {
         configService.checkMaxTimeDiffSecondsTolerable();
     }
-    
+
     /**
      * Failover If necessary.
      */
@@ -103,7 +112,7 @@ abstract class AbstractJobFacade implements JobFacade {
             failoverService.failoverIfNecessary();
         }
     }
-    
+
     /**
      * Register job begin.
      *
@@ -113,7 +122,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public void registerJobBegin(final ShardingContexts shardingContexts) {
         executionService.registerJobBegin(shardingContexts);
     }
-    
+
     /**
      * Register job completed.
      *
@@ -126,9 +135,9 @@ abstract class AbstractJobFacade implements JobFacade {
             failoverService.updateFailoverComplete(shardingContexts.getShardingItemParameters().keySet());
         }
     }
-    
+
     public abstract ShardingContexts getShardingContexts();
-    
+
     /**
      * Set task misfire flag.
      *
@@ -139,7 +148,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public boolean misfireIfRunning(final Collection<Integer> shardingItems) {
         return executionService.misfireIfHasRunningItems(shardingItems);
     }
-    
+
     /**
      * Clear misfire flag.
      *
@@ -149,7 +158,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public void clearMisfire(final Collection<Integer> shardingItems) {
         executionService.clearMisfire(shardingItems);
     }
-    
+
     /**
      * Judge job whether to need to execute misfire tasks.
      *
@@ -160,7 +169,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public boolean isExecuteMisfired(final Collection<Integer> shardingItems) {
         return configService.load(true).isMisfire() && !isNeedSharding() && !executionService.getMisfiredJobItems(shardingItems).isEmpty();
     }
-    
+
     /**
      * Judge job whether to need resharding.
      *
@@ -170,7 +179,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public boolean isNeedSharding() {
         return shardingService.isNeedSharding();
     }
-    
+
     /**
      * Call before job executed.
      *
@@ -182,7 +191,7 @@ abstract class AbstractJobFacade implements JobFacade {
             each.beforeJobExecuted(shardingContexts);
         }
     }
-    
+
     /**
      * Call after job executed.
      *
@@ -194,7 +203,7 @@ abstract class AbstractJobFacade implements JobFacade {
             each.afterJobExecuted(shardingContexts);
         }
     }
-    
+
     /**
      * Post job execution event.
      *
@@ -204,7 +213,7 @@ abstract class AbstractJobFacade implements JobFacade {
     public void postJobExecutionEvent(final JobExecutionEvent jobExecutionEvent) {
         jobTracingEventBus.post(jobExecutionEvent);
     }
-    
+
     /**
      * Post job status trace event.
      *
@@ -221,7 +230,7 @@ abstract class AbstractJobFacade implements JobFacade {
             log.trace(message);
         }
     }
-    
+
     /**
      * Get job runtime service.
      *
@@ -230,5 +239,29 @@ abstract class AbstractJobFacade implements JobFacade {
     @Override
     public JobRuntimeService getJobRuntimeService() {
         return new JobJobRuntimeServiceImpl(this);
+    }
+
+    /**
+     * Check if current server is enabled.
+     * Server is considered enabled only when:
+     * 1. Job is not shutdown (exists in JobRegistry)
+     * 2. JobInstance exists
+     * 3. Server status is ENABLED in ZooKeeper
+     *
+     * @return true if server is enabled, false if disabled or shutdown
+     */
+    @Override
+    public boolean isJobEnabled() {
+        // Check if job is shutdown in current JVM
+        if (JobRegistry.getInstance().isShutdown(jobName)) {
+            return false;
+        }
+        // Get job instance, return false if null (should not happen but be defensive)
+        JobInstance jobInstance = JobRegistry.getInstance().getJobInstance(jobName);
+        if (null == jobInstance) {
+            return false;
+        }
+        // Check server status in ZooKeeper
+        return serverService.isEnableServer(jobInstance.getServerIp());
     }
 }
